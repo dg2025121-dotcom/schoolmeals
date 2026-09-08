@@ -1,43 +1,39 @@
 # -*- coding: utf-8 -*-
 """
-neis_meal_report.py
-====================
-나이스(NEIS) 교육정보 개방 포털의 학교급식식단정보 API를 이용해
-- 학교별 "칼로리" 추이
-- 학교별 "단백질" 추이
-- 학교별 "가장 많이 나온 반찬" 순위
-세 가지를 plotly 그래프(HTML 대시보드)로 만들어주는 스크립트입니다.
+streamlit_app.py
+=================
+NEIS 학교급식 리포트 - Streamlit 웹 앱 버전
 
-사용 예시
----------
-python neis_meal_report.py --schools "서울고등학교" "부산중학교" --start 20250901 --end 20250930
+Streamlit Cloud 배포 방법
+------------------------
+1. 이 파일과 requirements.txt를 GitHub 저장소에 올린다.
+2. https://share.streamlit.io 에서 저장소를 연결하고
+   Main file path를 "streamlit_app.py"로 지정한다.
+3. 배포되면 화면에서 학교 이름 / 기간 / 인증키를 입력하고 조회한다.
 
-인증키(KEY)가 있으면 더 안정적으로 조회할 수 있습니다.
-python neis_meal_report.py --schools "서울고등학교" --start 20250901 --end 20250930 --key YOUR_NEIS_KEY
-
-옵션 없이 실행하면 --help로 사용법을 볼 수 있습니다.
+로컬 실행
+--------
+streamlit run streamlit_app.py
 """
 
-import argparse
 import re
-import sys
 from collections import Counter
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
-import requests
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import requests
+import streamlit as st
 
 SCHOOL_INFO_URL = "https://open.neis.go.kr/hub/schoolInfo"
 MEAL_INFO_URL = "https://open.neis.go.kr/hub/mealServiceDietInfo"
 
 
 # ---------------------------------------------------------------------------
-# 1. 학교 검색
+# NEIS API 호출 / 파싱 함수 (main.py와 동일한 로직)
 # ---------------------------------------------------------------------------
 def search_school(school_name: str, key: str | None = None) -> dict:
-    """학교 이름으로 교육청 코드(ATPT_OFCDC_SC_CODE)와 학교 코드(SD_SCHUL_CODE)를 찾는다."""
     params = {"Type": "json", "SCHUL_NM": school_name}
     if key:
         params["KEY"] = key
@@ -47,40 +43,30 @@ def search_school(school_name: str, key: str | None = None) -> dict:
     data = resp.json()
 
     if "schoolInfo" not in data:
-        raise ValueError(f"'{school_name}' 학교를 찾을 수 없습니다. (schoolInfo 응답 없음)")
+        raise ValueError(f"'{school_name}' 학교를 찾을 수 없습니다.")
 
     rows = data["schoolInfo"][1]["row"]
     if not rows:
-        raise ValueError(f"'{school_name}' 학교를 찾을 수 없습니다. (검색 결과 없음)")
-
-    if len(rows) > 1:
-        names = ", ".join(f"{r['SCHUL_NM']}({r['LCTN_SC_NM']})" for r in rows[:5])
-        print(
-            f"[안내] '{school_name}' 검색 결과가 {len(rows)}건입니다. "
-            f"첫 번째 결과를 사용합니다. (후보: {names})",
-            file=sys.stderr,
-        )
+        raise ValueError(f"'{school_name}' 학교를 찾을 수 없습니다.")
 
     row = rows[0]
-    return {
+    info = {
         "school_name": row["SCHUL_NM"],
         "atpt_code": row["ATPT_OFCDC_SC_CODE"],
         "school_code": row["SD_SCHUL_CODE"],
         "region": row.get("LCTN_SC_NM", ""),
     }
+    if len(rows) > 1:
+        candidates = ", ".join(f"{r['SCHUL_NM']}({r['LCTN_SC_NM']})" for r in rows[:5])
+        st.info(f"'{school_name}' 검색 결과 {len(rows)}건 중 첫 번째를 사용합니다. (후보: {candidates})")
+    return info
 
 
-# ---------------------------------------------------------------------------
-# 2. 급식 데이터 파싱 유틸
-# ---------------------------------------------------------------------------
 def clean_dish_names(ddish_nm: str) -> list[str]:
-    """DDISH_NM 문자열을 <br/> 기준으로 나누고, 뒤에 붙은 알레르기 번호 괄호를 제거한다."""
     items = ddish_nm.split("<br/>")
     cleaned = []
     for item in items:
-        # 예: "제육볶음(5.6.13)" -> "제육볶음"
         name = re.sub(r"\([\d.\s]+\)\s*$", "", item).strip()
-        # 별표, 세트 표시 등 잡문자 정리
         name = name.replace("*", "").strip()
         if name:
             cleaned.append(name)
@@ -88,7 +74,6 @@ def clean_dish_names(ddish_nm: str) -> list[str]:
 
 
 def extract_calorie(cal_info: str) -> float | None:
-    """CAL_INFO 예: '645.6 Kcal' -> 645.6"""
     if not cal_info:
         return None
     m = re.search(r"[\d.]+", cal_info)
@@ -96,24 +81,13 @@ def extract_calorie(cal_info: str) -> float | None:
 
 
 def extract_protein(ntr_info: str) -> float | None:
-    """NTR_INFO 예: '탄수화물(g) : 90.0<br/>단백질(g) : 20.5<br/>...' 에서 단백질 값 추출"""
     if not ntr_info:
         return None
     m = re.search(r"단백질\s*\([^)]*\)\s*:\s*([\d.]+)", ntr_info)
     return float(m.group(1)) if m else None
 
 
-# ---------------------------------------------------------------------------
-# 3. 급식 데이터 조회
-# ---------------------------------------------------------------------------
-def fetch_meals(
-    atpt_code: str,
-    school_code: str,
-    start_ymd: str,
-    end_ymd: str,
-    key: str | None = None,
-    meal_code: str = "2",  # 2 = 중식
-) -> list[dict]:
+def fetch_meals(atpt_code, school_code, start_ymd, end_ymd, key=None, meal_code="2"):
     params = {
         "Type": "json",
         "ATPT_OFCDC_SC_CODE": atpt_code,
@@ -131,7 +105,6 @@ def fetch_meals(
     data = resp.json()
 
     if "mealServiceDietInfo" not in data:
-        # RESULT 상자만 온 경우 (해당 기간에 급식 데이터가 없음. 오류 아님)
         return []
 
     rows = data["mealServiceDietInfo"][1]["row"]
@@ -140,32 +113,24 @@ def fetch_meals(
         dishes = clean_dish_names(row.get("DDISH_NM", ""))
         cal = extract_calorie(row.get("CAL_INFO", ""))
         protein = extract_protein(row.get("NTR_INFO", ""))
-        records.append(
-            {
-                "date": row["MLSV_YMD"],
-                "dishes": dishes,
-                "calorie": cal,
-                "protein": protein,
-            }
-        )
+        records.append({"date": row["MLSV_YMD"], "dishes": dishes, "calorie": cal, "protein": protein})
     return records
 
 
-# ---------------------------------------------------------------------------
-# 4. 학교별 데이터 수집 (여러 학교)
-# ---------------------------------------------------------------------------
-def build_school_dataset(school_names: list[str], start_ymd: str, end_ymd: str, key: str | None):
-    all_daily = []          # date/school/calorie/protein 테이블용
-    dish_counters = {}      # school -> Counter
+@st.cache_data(show_spinner=False, ttl=3600)
+def build_school_dataset(school_names: tuple, start_ymd: str, end_ymd: str, key: str | None):
+    all_daily = []
+    dish_counters = {}
+    logs = []
 
     for name in school_names:
         info = search_school(name, key)
         label = info["school_name"]
-        print(f"[조회 중] {label} ({info['region']}) - 코드 {info['atpt_code']}/{info['school_code']}")
+        logs.append(f"조회: {label} ({info['region']})")
 
         meals = fetch_meals(info["atpt_code"], info["school_code"], start_ymd, end_ymd, key)
         if not meals:
-            print(f"  -> 해당 기간에 급식 데이터가 없습니다.")
+            logs.append(f"  -> '{label}' 해당 기간 급식 데이터 없음")
             continue
 
         counter = Counter()
@@ -182,23 +147,18 @@ def build_school_dataset(school_names: list[str], start_ymd: str, end_ymd: str, 
         dish_counters[label] = counter
 
     df = pd.DataFrame(all_daily)
-    return df, dish_counters
+    return df, dish_counters, logs
 
 
 # ---------------------------------------------------------------------------
-# 5. plotly 그래프 3종 생성
+# 그래프 생성 함수
 # ---------------------------------------------------------------------------
 def make_calorie_figure(df: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
     for school, g in df.groupby("school"):
         g = g.sort_values("date")
         fig.add_trace(go.Scatter(x=g["date"], y=g["calorie"], mode="lines+markers", name=school))
-    fig.update_layout(
-        title="학교별 급식 칼로리 추이",
-        xaxis_title="날짜",
-        yaxis_title="칼로리 (Kcal)",
-        template="plotly_white",
-    )
+    fig.update_layout(title="학교별 급식 칼로리 추이", xaxis_title="날짜", yaxis_title="칼로리 (Kcal)", template="plotly_white")
     return fig
 
 
@@ -207,22 +167,13 @@ def make_protein_figure(df: pd.DataFrame) -> go.Figure:
     for school, g in df.groupby("school"):
         g = g.sort_values("date")
         fig.add_trace(go.Scatter(x=g["date"], y=g["protein"], mode="lines+markers", name=school))
-    fig.update_layout(
-        title="학교별 급식 단백질 추이",
-        xaxis_title="날짜",
-        yaxis_title="단백질 (g)",
-        template="plotly_white",
-    )
+    fig.update_layout(title="학교별 급식 단백질 추이", xaxis_title="날짜", yaxis_title="단백질 (g)", template="plotly_white")
     return fig
 
 
 def make_top_dishes_figure(dish_counters: dict, top_n: int = 10) -> go.Figure:
     schools = list(dish_counters.keys())
-    fig = make_subplots(
-        rows=1,
-        cols=len(schools),
-        subplot_titles=[f"{s} - 최다 등장 반찬" for s in schools],
-    )
+    fig = make_subplots(rows=1, cols=max(len(schools), 1), subplot_titles=[f"{s} - 최다 반찬" for s in schools])
 
     for i, school in enumerate(schools, start=1):
         top_items = dish_counters[school].most_common(top_n)
@@ -230,73 +181,82 @@ def make_top_dishes_figure(dish_counters: dict, top_n: int = 10) -> go.Figure:
             continue
         names, counts = zip(*top_items)
         fig.add_trace(
-            go.Bar(x=list(counts), y=list(names), orientation="h", name=school, showlegend=False),
-            row=1,
-            col=i,
+            go.Bar(x=list(counts), y=list(names), orientation="h", name=school, showlegend=False), row=1, col=i
         )
         fig.update_yaxes(autorange="reversed", row=1, col=i)
 
-    fig.update_layout(
-        title=f"학교별 급식 최다 등장 반찬 TOP {top_n}",
-        template="plotly_white",
-        height=500,
-    )
+    fig.update_layout(title=f"학교별 급식 최다 등장 반찬 TOP {top_n}", template="plotly_white", height=500)
     return fig
 
 
 # ---------------------------------------------------------------------------
-# 6. 세 그래프를 하나의 HTML로 합치기
+# Streamlit UI
 # ---------------------------------------------------------------------------
-def save_dashboard(fig_cal: go.Figure, fig_protein: go.Figure, fig_dishes: go.Figure, out_path: str):
-    parts = [
-        "<html><head><meta charset='utf-8'><title>학교 급식 리포트</title></head><body>",
-        "<h1 style='font-family:sans-serif;'>학교 급식 리포트</h1>",
-        fig_cal.to_html(full_html=False, include_plotlyjs="cdn"),
-        fig_protein.to_html(full_html=False, include_plotlyjs=False),
-        fig_dishes.to_html(full_html=False, include_plotlyjs=False),
-        "</body></html>",
-    ]
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(parts))
+st.set_page_config(page_title="NEIS 학교급식 리포트", layout="wide")
+st.title("🍱 학교 급식 리포트")
+st.caption("나이스(NEIS) 오픈 API 기반 · 칼로리 / 단백질 추이 · 최다 등장 반찬")
 
+with st.sidebar:
+    st.header("조회 조건")
+    schools_input = st.text_area(
+        "학교 이름 (줄바꿈으로 구분, 여러 개 가능)",
+        placeholder="예)\n서울고등학교\n경기중학교",
+        height=100,
+    )
+    col1, col2 = st.columns(2)
+    with col1:
+        start_date = st.date_input("시작일", value=date.today() - timedelta(days=30))
+    with col2:
+        end_date = st.date_input("종료일", value=date.today())
 
-# ---------------------------------------------------------------------------
-# 7. 메인
-# ---------------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser(description="NEIS 급식 데이터 plotly 리포트 생성기")
-    parser.add_argument("--schools", nargs="+", required=True, help="학교 이름 (여러 개 가능, 공백으로 구분)")
-    parser.add_argument("--start", required=True, help="조회 시작일 YYYYMMDD")
-    parser.add_argument("--end", required=True, help="조회 종료일 YYYYMMDD")
-    parser.add_argument("--key", default=None, help="NEIS 오픈API 인증키 (선택)")
-    parser.add_argument("--out", default="meal_report.html", help="출력 HTML 파일명")
-    parser.add_argument("--csv", default="meal_data.csv", help="원본 데이터 CSV 저장 파일명")
-    parser.add_argument("--top-n", type=int, default=10, help="최다 반찬 TOP N (기본 10)")
-    args = parser.parse_args()
+    key = st.text_input("NEIS 인증키 (선택)", type="password")
+    top_n = st.slider("최다 반찬 TOP N", min_value=3, max_value=20, value=10)
+    run = st.button("조회하기", type="primary", use_container_width=True)
 
-    df, dish_counters = build_school_dataset(args.schools, args.start, args.end, args.key)
+if run:
+    school_names = tuple(s.strip() for s in schools_input.splitlines() if s.strip())
+    if not school_names:
+        st.warning("학교 이름을 한 개 이상 입력해주세요.")
+        st.stop()
+
+    start_ymd = start_date.strftime("%Y%m%d")
+    end_ymd = end_date.strftime("%Y%m%d")
+
+    with st.spinner("NEIS API에서 데이터를 가져오는 중..."):
+        try:
+            df, dish_counters, logs = build_school_dataset(school_names, start_ymd, end_ymd, key or None)
+        except Exception as e:
+            st.error(f"오류가 발생했습니다: {e}")
+            st.stop()
+
+    for log in logs:
+        st.write(log)
 
     if df.empty:
-        print("조회된 급식 데이터가 없습니다. 학교 이름/기간을 확인해주세요.", file=sys.stderr)
-        sys.exit(1)
+        st.warning("조회된 급식 데이터가 없습니다. 학교 이름/기간을 확인해주세요.")
+        st.stop()
 
-    df.to_csv(args.csv, index=False, encoding="utf-8-sig")
-    print(f"[저장] 원본 데이터 -> {args.csv}")
+    st.success(f"총 {len(df)}건의 급식 데이터를 불러왔습니다.")
 
-    fig_cal = make_calorie_figure(df)
-    fig_protein = make_protein_figure(df)
-    fig_dishes = make_top_dishes_figure(dish_counters, top_n=args.top_n)
+    tab1, tab2, tab3, tab4 = st.tabs(["칼로리 추이", "단백질 추이", "최다 반찬", "원본 데이터"])
 
-    save_dashboard(fig_cal, fig_protein, fig_dishes, args.out)
-    print(f"[저장] 대시보드 -> {args.out}")
+    with tab1:
+        st.plotly_chart(make_calorie_figure(df), use_container_width=True)
 
-    # 콘솔 요약: 학교별 1위 반찬
-    print("\n=== 학교별 가장 많이 나온 반찬 ===")
-    for school, counter in dish_counters.items():
-        if counter:
-            top1, cnt = counter.most_common(1)[0]
-            print(f"- {school}: {top1} ({cnt}회)")
+    with tab2:
+        st.plotly_chart(make_protein_figure(df), use_container_width=True)
 
+    with tab3:
+        st.plotly_chart(make_top_dishes_figure(dish_counters, top_n=top_n), use_container_width=True)
+        st.subheader("학교별 1위 반찬")
+        for school, counter in dish_counters.items():
+            if counter:
+                top1, cnt = counter.most_common(1)[0]
+                st.write(f"- **{school}**: {top1} ({cnt}회)")
 
-if __name__ == "__main__":
-    main()
+    with tab4:
+        st.dataframe(df, use_container_width=True)
+        csv = df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button("CSV 다운로드", data=csv, file_name="meal_data.csv", mime="text/csv")
+else:
+    st.info("왼쪽 사이드바에 학교 이름과 기간을 입력하고 '조회하기'를 눌러주세요.")
