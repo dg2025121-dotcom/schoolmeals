@@ -209,7 +209,13 @@ with st.sidebar:
     with col2:
         end_date = st.date_input("종료일", value=date.today())
 
-    key = st.text_input("NEIS 인증키 (선택)", type="password")
+    secret_key = st.secrets.get("KEY", "").strip() if hasattr(st, "secrets") else ""
+    if secret_key:
+        key = secret_key
+        st.caption("✅ Secrets에 등록된 인증키를 사용합니다.")
+    else:
+        key = st.text_input("NEIS 인증키 (선택)", type="password")
+
     top_n = st.slider("최다 반찬 TOP N", min_value=3, max_value=20, value=10)
     run = st.button("조회하기", type="primary", use_container_width=True)
 
